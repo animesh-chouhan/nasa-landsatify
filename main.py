@@ -3,32 +3,42 @@
 
 from __future__ import annotations
 
-import random
 import re
 import shutil
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from utils import (
+    add_audio_to_video,
+    display_lyric_text,
+    load_letter_images,
+    normalize_lyric_text,
+    load_background_images,
+    render_frame,
+    render_video_from_frames,
+    write_concat_file,
+)
 
-LRC_FILE = Path("03 We Found Love.lrc")
+LRC_FILE = Path("we-found-love-edited.lrc")
 LETTER_DIR = Path("assets/landsat-letters")
+from utils import BACKGROUNDS_DIR
+
 BUILD_DIR = Path("build/lyric-video")
 FRAME_DIR = BUILD_DIR / "frames"
 CONCAT_FILE = BUILD_DIR / "frames.txt"
+OUTPUT_DIR = Path("build/output")
 AUDIO_FILE = Path("rihanna-we-found-love.mp3")
-SILENT_OUTPUT_FILE = Path("landsat-lyrics.mp4")
-OUTPUT_FILE = Path("landsat-lyrics-with-audio.mp4")
+SILENT_OUTPUT_FILE = OUTPUT_DIR / "landsat-lyrics.mp4"
+OUTPUT_FILE = OUTPUT_DIR / "landsat-lyrics-with-audio.mp4"
 
-WIDTH = 1920
-HEIGHT = 1080
-FPS = 30
-BACKGROUND = (8, 12, 18)
-LETTER_HEIGHT = 245
-LETTER_GAP = 14
-WORD_GAP = 58
-LINE_GAP = 34
+START_TIME = "00:00"
+END_TIME = "01:00"
+
+MAX_WORDS_PER_FRAME = 4
+MIN_SPLIT_DURATION = 1.2
+
+LRC_TAG_RE = re.compile(r"\[([^\]]+)\]")
+LRC_TIMESTAMP_RE = re.compile(r"^\d{1,3}:\d{2}(?:\.\d{1,3})?$")
 
 
 @dataclass(frozen=True)
@@ -37,272 +47,177 @@ class LyricLine:
     text: str
 
 
+@dataclass(frozen=True)
+class LyricSegment:
+    text: str
+    duration: float
+
+
 def parse_time(value: str) -> float:
-    minutes, seconds = value.split(":")
+    minutes, seconds = value.strip().split(":")
     return int(minutes) * 60 + float(seconds)
 
 
 def parse_length(value: str) -> float:
-    minutes, seconds = value.split(":")
+    minutes, seconds = value.strip().split(":")
     return int(minutes) * 60 + int(seconds)
+
+
+def parse_optional_time(value: str | float | int | None) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+    return parse_time(value)
 
 
 def parse_lrc(path: Path) -> tuple[list[LyricLine], float]:
     lines: list[LyricLine] = []
+    metadata: dict[str, str] = {}
     total_length = 0.0
-    timestamp_re = re.compile(r"\[(\d{2}:\d{2}(?:\.\d{1,2})?)\](.*)")
 
     for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         raw_line = raw_line.strip()
         if not raw_line:
             continue
 
-        if raw_line.startswith("[length:"):
-            total_length = parse_length(
-                raw_line.removeprefix("[length:").removesuffix("]")
-            )
+        tags = LRC_TAG_RE.findall(raw_line)
+        timestamps = [
+            parse_time(tag) for tag in tags if LRC_TIMESTAMP_RE.match(tag.strip())
+        ]
+
+        if not timestamps:
+            if len(tags) == 1 and ":" in tags[0]:
+                key, value = tags[0].split(":", 1)
+                metadata[key.strip().lower()] = value.strip()
             continue
 
-        match = timestamp_re.match(raw_line)
-        if match:
-            lines.append(LyricLine(parse_time(match.group(1)), match.group(2).strip()))
+        text = LRC_TAG_RE.sub("", raw_line).strip()
+        lines.extend(LyricLine(timestamp, text) for timestamp in timestamps)
+
+    if "length" in metadata:
+        total_length = parse_length(metadata["length"])
+
+    lines.sort(key=lambda line: line.time)
 
     return lines, total_length
 
 
-def load_letter_images() -> dict[str, list[Image.Image]]:
-    images: dict[str, list[Image.Image]] = {}
+def split_long_lyric(text: str, duration: float) -> list[LyricSegment]:
+    display_words = display_lyric_text(text).split()
+    normalized_words = [normalize_lyric_text(word) for word in display_words]
+    words_for_scoring = [word for word in normalized_words if word]
 
-    for letter_dir in sorted(LETTER_DIR.iterdir()):
-        if not letter_dir.is_dir():
+    if (
+        len(words_for_scoring) <= MAX_WORDS_PER_FRAME
+        or duration < MIN_SPLIT_DURATION * 2
+    ):
+        return [LyricSegment(display_lyric_text(text), duration)]
+
+    best_split = 1
+    best_score = float("inf")
+
+    for split_at in range(1, len(display_words)):
+        left = normalized_words[:split_at]
+        right = normalized_words[split_at:]
+        if len(left) == 1 or len(right) == 1:
             continue
 
-        letter = letter_dir.name.lower()
-        variants = []
-        for image_path in sorted(
-            letter_dir.glob("*.jpg"), key=lambda path: int(path.stem)
-        ):
-            image = Image.open(image_path).convert("RGB")
-            ratio = LETTER_HEIGHT / image.height
-            width = round(image.width * ratio)
-            variants.append(
-                image.resize((width, LETTER_HEIGHT), Image.Resampling.LANCZOS)
-            )
+        left_chars = sum(len(word) for word in left)
+        right_chars = sum(len(word) for word in right)
+        score = abs(left_chars - right_chars) + abs(len(left) - len(right)) * 2
 
-        if variants:
-            images[letter] = variants
+        if score < best_score:
+            best_score = score
+            best_split = split_at
 
-    return images
+    chunks = [
+        " ".join(display_words[:best_split]),
+        " ".join(display_words[best_split:]),
+    ]
+    normalized_chunks = [normalize_lyric_text(chunk) for chunk in chunks]
+    weights = [max(1, len(chunk.replace(" ", ""))) for chunk in normalized_chunks]
+    total_weight = sum(weights)
 
-
-def choose_letter_image(
-    letter_images: dict[str, list[Image.Image]],
-    letter: str,
-    line_index: int,
-    char_index: int,
-) -> Image.Image:
-    variants = letter_images[letter]
-    return variants[(line_index + char_index) % len(variants)]
-
-
-def split_into_rows(
-    text: str,
-    letter_images: dict[str, list[Image.Image]],
-    line_index: int,
-) -> list[list[Image.Image | None]]:
-    words = re.findall(r"[a-z]+", text.lower())
-    rows: list[list[Image.Image | None]] = [[]]
-    current_width = 0
-    char_index = 0
-
-    for word in words:
-        word_images = [
-            choose_letter_image(letter_images, letter, line_index, char_index + index)
-            for index, letter in enumerate(word)
-            if letter in letter_images
-        ]
-        if not word_images:
-            continue
-
-        word_width = sum(image.width for image in word_images)
-        word_width += LETTER_GAP * (len(word_images) - 1)
-        extra_gap = WORD_GAP if rows[-1] else 0
-
-        if rows[-1] and current_width + extra_gap + word_width > WIDTH - 180:
-            rows.append([])
-            current_width = 0
-            extra_gap = 0
-
-        if extra_gap:
-            rows[-1].append(None)
-            current_width += extra_gap
-
-        rows[-1].extend(word_images)
-        current_width += word_width
-        char_index += len(word)
-
-    return [row for row in rows if row]
-
-
-def row_width(row: list[Image.Image | None]) -> int:
-    width = 0
-    previous_was_letter = False
-
-    for item in row:
-        if item is None:
-            width += WORD_GAP
-            previous_was_letter = False
-            continue
-
-        if previous_was_letter:
-            width += LETTER_GAP
-        width += item.width
-        previous_was_letter = True
-
-    return width
-
-
-def make_background() -> Image.Image:
-    image = Image.new("RGB", (WIDTH, HEIGHT), BACKGROUND)
-    draw = ImageDraw.Draw(image)
-
-    for _ in range(900):
-        x = random.randrange(WIDTH)
-        y = random.randrange(HEIGHT)
-        shade = random.randrange(18, 58)
-        draw.point((x, y), fill=(shade, shade + 4, shade + 8))
-
-    return image.filter(ImageFilter.GaussianBlur(0.25))
-
-
-def render_frame(
-    text: str,
-    letter_images: dict[str, list[Image.Image]],
-    line_index: int,
-    output_path: Path,
-) -> None:
-    canvas = make_background()
-    rows = split_into_rows(text, letter_images, line_index)
-
-    if not rows:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        canvas.save(output_path)
-        return
-
-    total_height = len(rows) * LETTER_HEIGHT + (len(rows) - 1) * LINE_GAP
-    y = (HEIGHT - total_height) // 2
-
-    for row in rows:
-        x = (WIDTH - row_width(row)) // 2
-        previous_was_letter = False
-
-        for item in row:
-            if item is None:
-                x += WORD_GAP
-                previous_was_letter = False
-                continue
-
-            if previous_was_letter:
-                x += LETTER_GAP
-
-            shadow = Image.new("RGBA", item.size, (0, 0, 0, 120))
-            canvas.paste(shadow, (x + 8, y + 10), shadow)
-            canvas.paste(item, (x, y))
-            x += item.width
-            previous_was_letter = True
-
-        y += LETTER_HEIGHT + LINE_GAP
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(output_path)
-
-
-def write_concat_file(frame_paths: list[Path], durations: list[float]) -> None:
-    lines: list[str] = []
-
-    for frame_path, duration in zip(frame_paths, durations):
-        lines.append(f"file '{frame_path.resolve()}'")
-        lines.append(f"duration {duration:.3f}")
-
-    lines.append(f"file '{frame_paths[-1].resolve()}'")
-    CONCAT_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return [
+        LyricSegment(chunk, duration * weight / total_weight)
+        for chunk, weight in zip(chunks, weights)
+    ]
 
 
 def render_silent_video() -> None:
-    random.seed(7)
     lyrics, total_length = parse_lrc(LRC_FILE)
-    letter_images = load_letter_images()
+    letter_images = load_letter_images(LETTER_DIR)
+    background_images = load_background_images(BACKGROUNDS_DIR)
+    start_time = parse_optional_time(START_TIME) or 0.0
+    end_time = parse_optional_time(END_TIME) or total_length
 
     if not lyrics:
         raise RuntimeError(f"No timestamped lyrics found in {LRC_FILE}")
     if not letter_images:
         raise RuntimeError(f"No letter images found in {LETTER_DIR}")
+    if end_time <= start_time:
+        raise RuntimeError("END_TIME must be later than START_TIME")
 
     shutil.rmtree(BUILD_DIR, ignore_errors=True)
     FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     frame_paths: list[Path] = []
     durations: list[float] = []
-
-    if lyrics[0].time > 0:
+    if start_time == 0 and lyrics[0].time > 0:
         intro_path = FRAME_DIR / "0000.png"
-        render_frame("we found love", letter_images, -1, intro_path)
+        render_frame(
+            "We Found Love",
+            letter_images,
+            background_images,
+            intro_path,
+            background_index=0,
+            override_caption="Rihanna - We Found Love ft. Calvin Harris",  # Override caption for intro
+        )
         frame_paths.append(intro_path)
         durations.append(lyrics[0].time)
 
-    for index, line in enumerate(lyrics):
-        next_time = lyrics[index + 1].time if index + 1 < len(lyrics) else total_length
-        duration = max(0.1, next_time - line.time)
-        frame_path = FRAME_DIR / f"{len(frame_paths):04d}.png"
-        render_frame(line.text, letter_images, index, frame_path)
-        frame_paths.append(frame_path)
-        durations.append(duration)
+    for (
+        _index,
+        line,
+    ) in enumerate(  # Renamed to _index as it's no longer used for background selection
+        lyrics
+    ):  # Renamed to _index as it's no longer used for background
+        next_time = (
+            lyrics[_index + 1].time if _index + 1 < len(lyrics) else total_length
+        )
+        segment_start = max(line.time, start_time)
+        segment_end = min(next_time, end_time)
 
-    write_concat_file(frame_paths, durations)
+        if segment_end <= segment_start:
+            continue
+        duration = max(0.1, segment_end - segment_start)
 
-    command = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(CONCAT_FILE),
-        "-vf",
-        f"fps={FPS},format=yuv420p",
-        "-movflags",
-        "+faststart",
-        str(SILENT_OUTPUT_FILE),
-    ]
-    subprocess.run(command, check=True)
+        for segment in split_long_lyric(line.text, duration):
+            frame_index = len(frame_paths)
+            frame_path = FRAME_DIR / f"{frame_index:04d}.png"
+            render_frame(
+                segment.text,
+                letter_images,
+                background_images,
+                frame_path,
+                background_index=frame_index,  # Cycle background per actual frame
+            )
+            frame_paths.append(frame_path)
+            durations.append(segment.duration)
+
+    write_concat_file(CONCAT_FILE, frame_paths, durations)
+    render_video_from_frames(CONCAT_FILE, SILENT_OUTPUT_FILE)
 
 
 def add_audio() -> None:
-    if not AUDIO_FILE.exists():
-        raise RuntimeError(f"Audio file not found: {AUDIO_FILE}")
-    if not SILENT_OUTPUT_FILE.exists():
-        raise RuntimeError(f"Silent video file not found: {SILENT_OUTPUT_FILE}")
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(SILENT_OUTPUT_FILE),
-        "-i",
-        str(AUDIO_FILE),
-        "-c:v",
-        "copy",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-shortest",
-        "-movflags",
-        "+faststart",
-        str(OUTPUT_FILE),
-    ]
-    subprocess.run(command, check=True)
+    add_audio_to_video(
+        SILENT_OUTPUT_FILE,
+        AUDIO_FILE,
+        OUTPUT_FILE,
+        start_time=parse_optional_time(START_TIME) or 0.0,
+    )
 
 
 def make_video() -> None:
